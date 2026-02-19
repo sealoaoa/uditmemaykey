@@ -1,117 +1,339 @@
-require('dotenv').config();
 const express = require('express');
-const crypto = require('crypto');
+const axios = require('axios');
 const cors = require('cors');
+const dotenv = require('dotenv');
 
+dotenv.config();
 const app = express();
-app.use(express.json());
-app.use(cors());
 
-const keys = new Map();
-
-
-
-
-const DURATION = {
-  day:      1 * 24 * 60 * 60 * 1000,
-  week:     7 * 24 * 60 * 60 * 1000,
-  month:   30 * 24 * 60 * 60 * 1000,
-  lifetime: null,
+// Cấu hình CORS
+const corsOptions = {
+  origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 };
 
-// Tạo key 10 ký tự ngẫu nhiên (chữ hoa + số)
-function genKey() {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let key = '';
-  const bytes = crypto.randomBytes(10);
-  for (let i = 0; i < 10; i++) {
-    key += chars[bytes[i] % chars.length];
+app.use(cors(corsOptions));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Middleware logging
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
+  next();
+});
+
+// Config các API endpoints
+const API_CONFIGS = {
+  'tx': {
+    path: '/api/tx',
+    target: 'https://phanmemcongnghe.fun/',
+    apiParam: 'lc79_hu'
+  },
+  'md5': {
+    path: '/api/md5',
+    target: 'https://phanmemcongnghe.fun/',
+    apiParam: 'lc79_md5'
   }
-  return key;
+};
+
+// Hàm tạo headers proxy
+function createProxyHeaders(req) {
+  return {
+    'Host': 'phanmemcongnghe.fun',
+    'Origin': 'https://phanmemcongnghe.fun/',
+    'Referer': 'https://phanmemcongnghe.fun/',
+    'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Accept': req.headers['accept'] || 'application/json, text/plain, */*',
+    'Accept-Language': req.headers['accept-language'] || 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Accept-Encoding': req.headers['accept-encoding'] || 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin'
+  };
 }
 
-// POST /api/admin/create-key
-app.post('/api/admin/create-key', (req, res) => {
-  const { name, type } = req.body;
-  if (!name || !name.trim()) return res.status(400).json({ success: false, message: 'name là bắt buộc' });
-  if (!DURATION.hasOwnProperty(type)) return res.status(400).json({ success: false, message: 'type phải là: day, week, month, lifetime' });
+// Hàm xử lý proxy chung
+async function handleProxyRequest(req, res, apiConfig) {
+  try {
+    const { target, apiParam } = apiConfig;
+    
+    // Lấy tất cả query parameters
+    const params = { ...req.query };
+    
+    // Đảm bảo có param 'api' đúng
+    params.api = apiParam;
+    
+    // Tạo headers
+    const headers = createProxyHeaders(req);
+    
+    // Thêm Authorization nếu có
+    if (req.headers.authorization) {
+      headers['Authorization'] = req.headers.authorization;
+    }
 
-  // Tạo key không trùng
-  let key;
-  do { key = genKey(); } while (keys.has(key));
+    console.log(`[${apiParam}] Proxying to: ${target}`);
+    console.log(`[${apiParam}] Params:`, params);
 
-  keys.set(key, {
-    name: name.trim(), type, active: true, uses: 0,
-    createdAt: new Date(), activatedAt: null, expiresAt: null,
-    deviceId: null, deviceName: null,
-  });
+    // Gọi API
+    const response = await axios.get(target, {
+      params: params,
+      headers: headers,
+      timeout: parseInt(process.env.API_TIMEOUT) || 30000
+    });
 
-  res.status(201).json({ success: true, message: 'Tạo key thành công', key, name: name.trim(), type });
-});
+    // Trả về response
+    res.status(response.status).json(response.data);
+    
+  } catch (error) {
+    handleAxiosError(error, res, apiConfig.apiParam);
+  }
+}
 
-// GET /api/admin/keys
-app.get('/api/admin/keys', (req, res) => {
-  const now = new Date();
-  const data = [];
-  for (const [key, info] of keys.entries()) {
-    const expired = info.expiresAt ? now > info.expiresAt : false;
-    data.push({
-      key, name: info.name, type: info.type, active: info.active,
-      uses: info.uses, createdAt: info.createdAt, activatedAt: info.activatedAt,
-      expiresAt: info.expiresAt, deviceName: info.deviceName, expired,
-      status: !info.active ? 'revoked' : expired ? 'expired' : info.activatedAt ? 'active' : 'unused',
+// Hàm xử lý lỗi
+function handleAxiosError(error, res, apiName) {
+  console.error(`[${apiName}] Proxy error:`, error.message);
+  
+  if (error.response) {
+    res.status(error.response.status).json({
+      error: true,
+      api: apiName,
+      message: error.response.data?.message || 'API Error',
+      status: error.response.status
+    });
+  } else if (error.request) {
+    res.status(504).json({
+      error: true,
+      api: apiName,
+      message: 'Gateway Timeout - No response from target API',
+      code: 'PROXY_TIMEOUT'
+    });
+  } else {
+    res.status(500).json({
+      error: true,
+      api: apiName,
+      message: error.message,
+      code: 'PROXY_ERROR'
     });
   }
-  data.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  res.json({ success: true, total: data.length, keys: data });
+}
+
+// Tạo tự động các routes từ config
+Object.values(API_CONFIGS).forEach(config => {
+  // GET requests
+  app.get(config.path, (req, res) => {
+    handleProxyRequest(req, res, config);
+  });
+  
+  // POST requests
+  app.post(config.path, async (req, res) => {
+    try {
+      const { target, apiParam } = config;
+      
+      const headers = createProxyHeaders(req);
+      headers['Content-Type'] = req.headers['content-type'] || 'application/json';
+      
+      if (req.headers.authorization) {
+        headers['Authorization'] = req.headers.authorization;
+      }
+
+      // Kết hợp params từ query string và body
+      const params = { ...req.query, api: apiParam };
+      
+      const response = await axios.post(target, req.body, {
+        params: params,
+        headers: headers,
+        timeout: parseInt(process.env.API_TIMEOUT) || 30000
+      });
+
+      res.status(response.status).json(response.data);
+      
+    } catch (error) {
+      handleAxiosError(error, res, apiParam);
+    }
+  });
 });
 
-// PATCH /api/admin/revoke-key
-app.patch('/api/admin/revoke-key', (req, res) => {
-  const { key } = req.body;
-  if (!key) return res.status(400).json({ success: false, message: 'key là bắt buộc' });
-  const info = keys.get(key);
-  if (!info) return res.status(404).json({ success: false, message: 'Không tìm thấy key' });
-  info.active = false;
-  res.json({ success: true, message: 'Key đã bị vô hiệu hoá' });
-});
-
-// DELETE /api/admin/delete-key
-app.delete('/api/admin/delete-key', (req, res) => {
-  const { key } = req.body;
-  if (!key) return res.status(400).json({ success: false, message: 'key là bắt buộc' });
-  if (!keys.has(key)) return res.status(404).json({ success: false, message: 'Không tìm thấy key' });
-  keys.delete(key);
-  res.json({ success: true, message: 'Key đã bị xoá' });
-});
-
-// POST /api/verify
-app.post('/api/verify', (req, res) => {
-  const { key, deviceId, deviceName } = req.body;
-  if (!key) return res.status(400).json({ success: false, message: 'key là bắt buộc' });
-  if (!deviceId) return res.status(400).json({ success: false, message: 'deviceId là bắt buộc' });
-
-  const info = keys.get(key);
-  if (!info) return res.status(401).json({ success: false, message: 'Key không hợp lệ' });
-  if (!info.active) return res.status(403).json({ success: false, message: 'Key đã bị vô hiệu hoá' });
-
-  const now = new Date();
-  if (info.activatedAt) {
-    if (info.deviceId !== deviceId) return res.status(403).json({ success: false, message: 'Key này đã được dùng trên thiết bị khác', deviceName: info.deviceName });
-    if (info.expiresAt && now > info.expiresAt) return res.status(403).json({ success: false, message: 'Key đã hết hạn' });
-  } else {
-    info.activatedAt = now;
-    info.deviceId = deviceId;
-    info.deviceName = deviceName || 'Không rõ';
-    if (DURATION[info.type] !== null) info.expiresAt = new Date(now.getTime() + DURATION[info.type]);
-    else info.expiresAt = null;
+// Dynamic endpoint
+app.get('/api/:type', (req, res) => {
+  const { type } = req.params;
+  
+  const apiMap = {
+    'tx': API_CONFIGS.tx,
+    'md5': API_CONFIGS.md5
+  };
+  
+  const config = apiMap[type];
+  
+  if (!config) {
+    return res.status(404).json({
+      error: true,
+      message: 'API type not found',
+      availableTypes: Object.keys(apiMap)
+    });
   }
-
-  info.uses += 1;
-  res.json({ success: true, message: 'Key hợp lệ', user: { name: info.name, type: info.type, uses: info.uses, activatedAt: info.activatedAt, expiresAt: info.expiresAt, deviceName: info.deviceName } });
+  
+  handleProxyRequest(req, res, config);
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'KeyAuth API 🚀', totalKeys: keys.size }));
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    timestamp: new Date().toISOString()
+  });
+});
 
+// Test endpoint
+app.get('/test', async (req, res) => {
+  const results = {};
+  
+  for (const [key, config] of Object.entries(API_CONFIGS)) {
+    try {
+      const testResponse = await axios.get(config.target, {
+        params: { api: config.apiParam },
+        headers: createProxyHeaders(req),
+        timeout: 5000
+      });
+      
+      results[key] = {
+        status: testResponse.status,
+        success: true
+      };
+    } catch (error) {
+      results[key] = {
+        status: error.response?.status || 'ERROR',
+        success: false,
+        error: error.message
+      };
+    }
+  }
+  
+  res.json({
+    timestamp: new Date().toISOString(),
+    results: results
+  });
+});
+
+// Route chính - chỉ hiển thị endpoints
+app.get('/', (req, res) => {
+  res.json(['/api/tx', '/api/md5']);
+});
+
+// Batch request endpoint
+app.post('/api/batch', async (req, res) => {
+  try {
+    const { requests } = req.body;
+    
+    if (!Array.isArray(requests)) {
+      return res.status(400).json({
+        error: true,
+        message: 'Requests must be an array'
+      });
+    }
+    
+    const results = [];
+    
+    for (const request of requests) {
+      const { endpoint, params = {}, method = 'GET', data = null } = request;
+      
+      const apiMap = {
+        '/api/tx': API_CONFIGS.tx,
+        '/api/md5': API_CONFIGS.md5,
+        'tx': API_CONFIGS.tx,
+        'md5': API_CONFIGS.md5
+      };
+      
+      const config = apiMap[endpoint];
+      
+      if (!config) {
+        results.push({
+          endpoint,
+          success: false,
+          error: 'Invalid endpoint'
+        });
+        continue;
+      }
+      
+      try {
+        const headers = createProxyHeaders(req);
+        headers['Content-Type'] = 'application/json';
+        
+        const allParams = { ...params, api: config.apiParam };
+        
+        let response;
+        if (method.toUpperCase() === 'POST') {
+          response = await axios.post(config.target, data, {
+            params: allParams,
+            headers: headers,
+            timeout: 15000
+          });
+        } else {
+          response = await axios.get(config.target, {
+            params: allParams,
+            headers: headers,
+            timeout: 15000
+          });
+        }
+        
+        results.push({
+          endpoint,
+          success: true,
+          status: response.status,
+          data: response.data
+        });
+      } catch (error) {
+        results.push({
+          endpoint,
+          success: false,
+          error: error.message,
+          status: error.response?.status
+        });
+      }
+    }
+    
+    res.json({
+      timestamp: new Date().toISOString(),
+      results: results
+    });
+    
+  } catch (error) {
+    res.status(500).json({
+      error: true,
+      message: error.message
+    });
+  }
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    error: true,
+    message: 'Route not found',
+    availableRoutes: ['/api/tx', '/api/md5', '/health', '/test']
+  });
+});
+
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('Global error:', err);
+  res.status(500).json({
+    error: true,
+    message: 'Internal server error'
+  });
+});
+
+// Khởi động server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+const HOST = process.env.HOST || '0.0.0.0';
+
+app.listen(PORT, HOST, () => {
+  console.log(`🚀 API Proxy Server running on http://${HOST}:${PORT}`);
+  console.log(`\n📡 Available Endpoints:`);
+  console.log(`   /api/tx`);
+  console.log(`   /api/md5`);
+
+});
